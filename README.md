@@ -1,93 +1,117 @@
 # STEDI Lakehouse Data Pipeline on AWS
 
-This project implements an end-to-end ETL (Extract, Transform, Load) pipeline on AWS to build a lakehouse solution for STEDI. The pipeline processes raw, semi-structured JSON data from various sources (customer website, mobile app, and IoT devices) and transforms it into a clean, structured, and curated dataset ready for machine learning analysis.
+An end-to-end ETL pipeline that turns raw, semi-structured JSON from three separate STEDI systems into a single consented, privacy-compliant training table for the data science team — built on S3, AWS Glue, the Glue Data Catalog, and Athena.
 
 ---
 
-## The Challenge
+## Business Context
 
-The STEDI data science team needed to analyze sensor data from their Step Trainer devices to build predictive models. However, they faced several critical data challenges:
+STEDI sells a balance-training device (the Step Trainer). The data science team wants to train a model that detects steps from device and phone sensor readings, but the raw data cannot be used as-is:
 
-1.  **Data Privacy**: The raw data included customers who had not consented to having their data used for research. This data needed to be filtered out to respect user privacy.
-2.  **Data Quality**: A bug in the customer fulfillment system resulted in unreliable and duplicated `serialNumber` data in the customer records, making it impossible to link customers to their devices reliably.
-3.  **Data Silos**: The data was spread across three different sources, making it difficult to perform combined analysis.
+1. **Consent** — only a subset of customers agreed to have their data used for research. Everyone else must be excluded before any analysis touches their records.
+2. **A broken identity key** — a defect in the customer fulfillment system produced unreliable and duplicated `serialNumber` values in the customer records, so devices could not be reliably attributed to their owners.
+3. **Three disconnected sources** — customer records, phone accelerometer readings, and device sensor readings arrive independently with no shared model.
 
-This project solves these challenges by building a robust data pipeline that cleans, joins, and restructures the data into a single, reliable, and analysis-ready table.
+This pipeline resolves all three before any data reaches the modeling layer.
+
+---
+
+## Consumers of This Pipeline
+
+| Consumer | Table they read | What they need from it |
+| --- | --- | --- |
+| Data science team | `machine_learning_curated` | Paired device + phone sensor readings, consented only |
+| Privacy / compliance | `customer_trusted` | Evidence that non-consenting customers never propagate downstream |
+| Product analytics | `customers_curated` | The consenting, *active* customer base |
+| Fulfillment engineering | `step_trainer_trusted` | Visibility into how many devices fail owner attribution |
+
+---
+
+## Data Sources
+
+All three land as line-delimited JSON in `s3://stedi-lakehouse-yazeedalmuhlaki/`.
+
+| Source | Landing prefix | Grain | Key fields |
+| --- | --- | --- | --- |
+| Customer registration (website) | `customer/landing/` | One row per customer | `email`, `serialNumber`, `customerName`, `birthDay`, `registrationDate`, `shareWithResearchAsOfDate`, `shareWithPublicAsOfDate`, `shareWithFriendsAsOfDate` |
+| Accelerometer (mobile app) | `accelerometer/landing/` | One row per reading | `user` (email), `timeStamp`, `x`, `y`, `z` |
+| Step Trainer (IoT device) | `step_trainer/landing/` | One row per reading | `serialNumber`, `sensorReadingTime`, `distanceFromObject` |
+
+The only link between the app data and the device data is the customer: accelerometer rows carry an email, step trainer rows carry a serial number, and the customer record is what maps one to the other.
 
 ---
 
 ## Lakehouse Architecture
 
-The pipeline follows a multi-layered lakehouse architecture, progressively refining data as it moves through different zones in Amazon S3.
+Data moves through three zones in S3, each registered as a database in the Glue Data Catalog (`stedi_db`) so every stage is queryable in Athena.
 
-* **Landing Zone (Bronze)**: Stores the raw, untouched JSON data as it arrives from the source systems.
-* **Trusted Zone (Silver)**: Contains data that has been cleaned, filtered, and validated. In this zone, we filter for customer consent and solve the `serialNumber` data quality issue.
-* **Curated Zone (Gold)**: Holds the final, aggregated, and business-ready dataset, specifically modeled for the data science team's machine learning use case.
-
----
-
-## ⚙️ Technology Stack
-
-* **Data Lake Storage**: Amazon S3
-* **ETL Service**: AWS Glue & Glue Studio
-* **Data Catalog**: AWS Glue Data Catalog
-* **Interactive Querying**: Amazon Athena
-* **Core Engine**: Apache Spark
-* **Languages**: Python (PySpark) & SQL
+- **Landing** — raw and immutable, exactly as received. Never modified, so any downstream logic can be corrected and replayed without re-requesting from source systems.
+- **Trusted** — filtered and validated. Consent is enforced here, and the `serialNumber` defect is resolved here.
+- **Curated** — modeled for a specific consumer. `machine_learning_curated` exists to serve the data science team; a different consumer would build its own curated table from the trusted zone rather than repeat the cleaning.
 
 ---
 
-## ETL Workflow
+## Jobs
 
-The entire pipeline is orchestrated by a series of AWS Glue jobs. Each job performs a specific transformation, moving data from one zone to the next.
+Run in this order — later jobs depend on the output of earlier ones.
 
-### 1. Landing Zone to Trusted Zone
+### 1. `customer_landing_to_trusted.py`
+**Purpose:** enforce research consent at the entry point, so no non-consenting customer exists anywhere downstream.
+**In:** `customer/landing/` → **Out:** `customer/trusted/data/` (`customer_trusted`)
+**Logic:** Spark SQL filter on `shareWithResearchAsOfDate IS NOT NULL`.
 
-* **`customer_landing_to_trusted.py`**:
-    * **Purpose**: Filters raw customer data to keep only records of users who have consented to share their data for research.
-    * **Input**: `customer_landing`
-    * **Output**: `customer_trusted`
-    * **Transformation**: A SQL `WHERE` clause filters for records where `shareWithResearchAsOfDate` is not null.
+### 2. `accelerometer_landing_to_trusted.py`
+**Purpose:** restrict phone sensor readings to consenting customers only.
+**In:** `accelerometer/landing/`, `customer_trusted` → **Out:** `accelerometer/trusted/data/` (`accelerometer_trusted`)
+**Logic:** join `accelerometer.user = customer.email`, then keep only `user`, `timeStamp`, `x`, `y`, `z` — the join filters, it does not enrich, so customer attributes are dropped after it.
 
-* **`accelerometer_landing_to_trusted.py`**:
-    * **Purpose**: Sanitizes accelerometer data to include only readings from trusted customers.
-    * **Inputs**: `accelerometer_landing`, `customer_trusted`
-    * **Output**: `accelerometer_trusted`
-    * **Transformation**: An `INNER JOIN` on the user's email.
+### 3. `customer_trusted_to_curated.py`
+**Purpose:** produce the definitive customer list — consenting **and** active. A consenting customer who never generated a reading is not useful as a modeling reference.
+**In:** `customer_trusted`, `accelerometer_trusted` → **Out:** `customer/curated/data/` (`customers_curated`)
+**Logic:** join on `email = user`, drop the accelerometer columns, then drop duplicates back to one row per customer.
 
-### 2. Trusted Zone to Curated Zone
+### 4. `step_trainer_landing_to_trusted.py`
+**Purpose:** resolve the `serialNumber` defect. The trustworthy serial number is the one emitted by the device itself, not the one stored on the customer record, so the curated customer list is used as the reference set.
+**In:** `step_trainer/landing/`, `customers_curated` → **Out:** `step_trainer/trusted/data/` (`step_trainer_trusted`)
+**Logic:** `INNER JOIN` on `serialNumber` — any device reading without a known, consenting owner is dropped.
 
-* **`customer_trusted_to_curated.py`**:
-    * **Purpose**: Creates a final, definitive master list of unique customers who are both consenting and active (have submitted sensor data).
-    * **Inputs**: `customer_trusted`, `accelerometer_trusted`
-    * **Output**: `customers_curated`
-    * **Transformation**: An `INNER JOIN` followed by a `Drop Duplicates` transform to ensure a unique customer list.
-
-* **`step_trainer_landing_to_trusted.py`**:
-    * **Purpose**: Solves the `serialNumber` bug by joining the raw step trainer data (which has the correct serial numbers) with the curated customer list.
-    * **Inputs**: `step_trainer_landing`, `customers_curated`
-    * **Output**: `step_trainer_trusted`
-    * **Transformation**: A robust SQL `INNER JOIN` on `serialNumber`.
-
-* **`machine_learning_curated.py`**:
-    * **Purpose**: Creates the final table for the data science team by combining trusted step trainer and accelerometer readings that occurred at the same time.
-    * **Inputs**: `step_trainer_trusted`, `accelerometer_trusted`
-    * **Output**: `machine_learning_curated`
-    * **Transformation**: A SQL `INNER JOIN` on the event timestamps (`sensorReadingTime` and `timeStamp`).
+### 5. `machine_learning_curated.py`
+**Purpose:** produce the training table by pairing each device reading with the phone reading captured at the same moment.
+**In:** `step_trainer_trusted`, `accelerometer_trusted` → **Out:** `machine_learning/curated/data/` (`machine_learning_curated`)
+**Logic:** `INNER JOIN` on `sensorReadingTime = timeStamp`.
 
 ---
 
-## ✅ Final Table Counts
+## Row Counts by Stage
 
-The following table summarizes the row counts at each stage of the pipeline, confirming the successful execution of all transformations.
+| Zone | Table | Rows |
+| --- | --- | --- |
+| Landing | `customer_landing` | 956 |
+| Landing | `accelerometer_landing` | 81,273 |
+| Landing | `step_trainer_landing` | 28,680 |
+| Trusted | `customer_trusted` | 482 |
+| Trusted | `accelerometer_trusted` | 40,981 |
+| Trusted | `step_trainer_trusted` | 14,460 |
+| Curated | `customers_curated` | 482 |
+| Curated | `machine_learning_curated` | 43,681 |
 
-| Zone      | Table Name                 | Row Count |
-| :-------- | :------------------------- | :-------- |
-| Landing   | `customer_landing`         | 956       |
-| Landing   | `accelerometer_landing`    | 81,273    |
-| Landing   | `step_trainer_landing`     | 28,680    |
-| **Trusted** | **`customer_trusted`** | **482** |
-| **Trusted** | **`accelerometer_trusted`** | **40,981** |
-| **Trusted** | **`step_trainer_trusted`** | **14,460** |
-| **Curated** | **`customers_curated`** | **482** |
-| **Curated** | **`machine_learning_curated`** | **43,681** |
+Consent removes roughly half of every source, which is expected. `customers_curated` matching `customer_trusted` exactly means every consenting customer had at least one accelerometer reading.
+
+---
+
+
+## Stack
+
+Amazon S3 · AWS Glue (Studio, Spark jobs, Data Catalog) · Apache Spark / PySpark · Amazon Athena · Python
+
+---
+
+## Repository Layout
+
+```
+.
+├── python_scripts/   # The five Glue ETL jobs
+├── SQL/              # DDL for the Glue Catalog tables
+├── screenshots/      # Athena verification queries and row counts
+└── stedi_lakehouse_data_pipeline.png
+```
